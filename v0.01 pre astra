@@ -1,0 +1,590 @@
+const crypto = require("crypto"); 
+// Importa el módulo crypto de Node.js.
+// Lo necesitamos para calcular la firma HMAC SHA-256 del webhook de LearnUpon.
+
+async function getLearnUponPefcUserIdByEmail(context, email) {
+  // Busca el PEFC User ID real en LearnUpon usando el email del webhook.
+  // El endpoint /users/search?email=... devuelve CustomData.pefc_user_id.
+
+  if (!email) {
+    context.log("LearnUpon PEFC User ID lookup skipped: missing email");
+    return "";
+  }
+
+  const baseUrl = process.env.LEARNUPON_BASE_URL;
+  const apiUsername = process.env.LEARNUPON_API_USERNAME;
+  const apiPassword = process.env.LEARNUPON_API_PASSWORD;
+
+  if (!baseUrl || !apiUsername || !apiPassword) {
+    context.log("LearnUpon API config missing. Cannot fetch PEFC User ID.");
+    return "";
+  }
+
+  const authToken = Buffer.from(apiUsername + ":" + apiPassword).toString("base64");
+
+  const url =
+    baseUrl.replace(/\/$/, "") +
+    "/users/search?email=" +
+    encodeURIComponent(String(email));
+
+  context.log("Fetching LearnUpon PEFC User ID by email:", email);
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: "Basic " + authToken,
+      "Content-Type": "application/json"
+    }
+  });
+
+  let result;
+
+  try {
+    result = await response.json();
+  } catch (jsonError) {
+    context.log("LearnUpon response was not valid JSON:", jsonError.message);
+    return "";
+  }
+
+  if (!response.ok) {
+    context.log("LearnUpon user search error:", JSON.stringify(result));
+    return "";
+  }
+
+  const userObject = Array.isArray(result.user)
+    ? result.user[0]
+    : result.user || result.User || result;
+
+  if (!userObject) {
+    context.log("LearnUpon user object not found in email search response.");
+    return "";
+  }
+
+  // Camino principal confirmado por Apps Script:
+  // CustomData.pefc_user_id
+  if (userObject.CustomData && userObject.CustomData.pefc_user_id) {
+    return String(userObject.CustomData.pefc_user_id);
+  }
+
+  if (userObject.customData && userObject.customData.pefc_user_id) {
+    return String(userObject.customData.pefc_user_id);
+  }
+
+  // Camino alternativo por si LearnUpon devuelve definitions + values.
+  const definitions =
+    result.customDataFieldDefintions ||
+    result.customDataFieldDefinitions ||
+    result.custom_data_field_definitions ||
+    [];
+
+  const values =
+    userObject.customDataFieldValues ||
+    userObject.custom_data_field_values ||
+    result.customDataFieldValues ||
+    result.custom_data_field_values ||
+    [];
+
+  const pefcDefinition = definitions.find((definition) =>
+    String(definition.label || "").toLowerCase() === "pefc_user_id"
+  );
+
+  if (!pefcDefinition) {
+    context.log("pefc_user_id definition not found in email search response.");
+    return "";
+  }
+
+  const matchingValue = values.find((value) =>
+    String(value.definition_id || value.definitionId || "") === String(pefcDefinition.id)
+  );
+
+  if (!matchingValue || matchingValue.value === null || matchingValue.value === undefined) {
+    context.log("pefc_user_id value not found in email search response.");
+    return "";
+  }
+
+  if (Array.isArray(matchingValue.value)) {
+    return matchingValue.value.join(", ");
+  }
+
+  return String(matchingValue.value);
+}
+
+module.exports = async function (context, req) {
+  try { // Inicio del bloque principal: si algo falla, saltará al catch final
+
+    context.log("LearnUpon webhook received"); // Log básico para confirmar que Azure recibió una llamada
+
+    /************************************************************
+     * 1. READ BODY
+     ************************************************************/
+
+    const body = req.body;
+
+    if (!body) {
+      context.res = {
+        status: 400,
+        body: "Missing request body"
+      };
+      return;
+    }
+
+    const rawBody =
+      req.rawBody ||
+      (typeof req.body === "string" ? req.body : JSON.stringify(req.body));  
+
+    /************************************************************
+     * 0. VALIDAR FIRMA DEL WEBHOOK DE LEARNUPON
+     ************************************************************/
+
+    const learnUponWebhookSecret = process.env.LEARNUPON_WEBHOOK_SECRET;
+    // Lee la secret key guardada en Azure Environment Variables.
+    // Esta debe coincidir exactamente con la Secret Key configurada en LearnUpon.
+
+    if (!learnUponWebhookSecret) {
+      // Si esta variable no existe en Azure, no podemos validar la firma.
+      context.res = {
+        status: 500,
+        body: "Missing LEARNUPON_WEBHOOK_SECRET"
+      };
+      return;
+    }
+
+    const receivedSignature =
+      req.headers["x-webhook-signature"] ||
+      req.headers["X-Webhook-Signature"];
+    // Lee la firma enviada por LearnUpon en los headers.
+    // Azure normalmente convierte los headers a minúsculas, pero dejamos fallback.
+
+    if (!receivedSignature) {
+      // Si no hay firma, rechazamos la llamada.
+      // Esto evita que alguien llame manualmente al endpoint sin firma.
+      context.res = {
+        status: 401,
+        body: "Missing x-webhook-signature"
+      };
+      return;
+    }
+
+    const calculatedSignature = crypto
+      .createHmac("sha256", learnUponWebhookSecret)
+      .update(rawBody, "utf8")
+      .digest("hex");
+    // Calcula nuestra propia firma usando:
+    // - algoritmo HMAC SHA-256
+    // - la secret key compartida con LearnUpon
+    // - el raw body recibido
+
+    const receivedBuffer = Buffer.from(receivedSignature, "utf8");
+    const calculatedBuffer = Buffer.from(calculatedSignature, "utf8");
+    // Convertimos ambas firmas a Buffer para poder compararlas de forma segura.
+
+    const signaturesMatch =
+      receivedBuffer.length === calculatedBuffer.length &&
+      crypto.timingSafeEqual(receivedBuffer, calculatedBuffer);
+    // timingSafeEqual evita comparaciones inseguras carácter por carácter.
+    // Primero comprobamos longitud porque timingSafeEqual falla si difieren.
+
+context.log("Webhook version:", req.headers["x-webhook-version"]);
+context.log("Webhook type:", req.headers["x-webhook-type"]);
+context.log("Received signature:", receivedSignature);
+context.log("Calculated signature:", calculatedSignature);
+context.log("Raw body available:", req.rawBody ? "YES" : "NO");
+context.log("Raw body length:", rawBody ? rawBody.length : 0);
+context.log("Signature match:", signaturesMatch);
+context.log("Webhook ID:", req.headers["x-webhook-id"]);
+context.log("Webhook attempt:", req.headers["x-webhook-attempt"]);
+context.log("Webhook subscription ID:", req.headers["x-webhook-subscription-id"]);
+context.log("LearnUpon timestamp:", req.headers["x-learnupon-timestamp"]);
+
+    if (!signaturesMatch) {
+      // Si la firma calculada no coincide con la firma recibida,
+      // la llamada puede no venir de LearnUpon o el body pudo ser alterado.
+      context.log("Invalid LearnUpon webhook signature");
+      context.log("Received signature:", receivedSignature);
+      context.log("Calculated signature:", calculatedSignature);
+
+      context.res = {
+        status: 401,
+        body: "Invalid LearnUpon webhook signature"
+      };
+      return;
+    }
+
+    context.log("LearnUpon webhook signature validated");
+    // Si llegamos aquí, la firma es válida.
+
+    /************************************************************
+     * 1. VALIDAR TIPO DE WEBHOOK
+     ************************************************************/
+
+    const webhookType =
+      req.headers["x-webhook-type"] || // LearnUpon normalmente manda los headers en minúsculas
+      req.headers["X-Webhook-Type"];   // Fallback por si Azure los conserva con mayúsculas
+
+    if (webhookType !== "ecommerce_purchase_completion") { // Solo aceptamos compras eCommerce completadas
+      context.res = {
+        status: 400, // Bad Request: la llamada llegó, pero no es el evento correcto
+        body: "Invalid webhook type: " + webhookType
+      };
+      return; // Detiene la ejecución para no tocar Stripe
+    }
+
+    context.log("Webhook type validated:", webhookType); // Log de control
+
+    // LearnUpon envía normalmente { data: [ { ...orden... } ] }
+    // Este código toma el primer elemento de data.
+    const order = Array.isArray(body.data) ? body.data[0] : body.data;
+
+    if (!order) { // Si no encontramos la orden, paramos
+      context.res = {
+        status: 400,
+        body: "Missing LearnUpon order object"
+      };
+      return;
+    }
+
+    if (!order.orderId) { // orderId es el dato que coincide con Stripe metadata.spree_order_id
+      context.res = {
+        status: 400,
+        body: "Missing LearnUpon orderId"
+      };
+      return;
+    }
+
+    const orderId = String(order.orderId); // Convertimos a texto porque Stripe metadata es texto
+
+    context.log("LearnUpon orderId:", orderId); // Log útil para depurar
+
+
+    /************************************************************
+     * 3. VALIDAR QUE LA ORDEN ESTÁ COMPLETA Y PAGADA
+     ************************************************************/
+
+    if (order.orderState !== "complete" || order.paymentState !== "paid") {
+      context.res = {
+        status: 400,
+        body:
+          "Order is not complete/paid. orderState=" +
+          order.orderState +
+          ", paymentState=" +
+          order.paymentState
+      };
+      return; // No actualizamos Stripe si el pedido no está completado y pagado
+    }
+
+    context.log("Order state/payment state validated"); // Log de control
+
+
+    /************************************************************
+     * 4. EXTRAER DATOS ÚTILES DEL WEBHOOK
+     ************************************************************/
+
+    const user = order.user || {}; // Datos del usuario/comprador
+
+    const lineItem =
+      order.lineItems && order.lineItems.length > 0
+        ? order.lineItems[0] // De momento tomamos el primer curso/producto comprado
+        : {};
+
+    const courseName = String(lineItem.productName || ""); // Nombre del curso/producto
+
+    context.log("Course/product name:", courseName); // Log útil para confirmar que llegó el curso
+
+    const learnUponWebhookUserId =
+  user.userId ||
+  user.id ||
+  user.user_id ||
+  order.userId ||
+  order.user_id ||
+  "";
+
+context.log("LearnUpon webhook userId:", learnUponWebhookUserId);
+context.log("LearnUpon webhook user email:", user.email);
+
+let pefcUserId = "NOT_FOUND";
+
+try {
+  const pefcUserIdFromLearnUpon = await getLearnUponPefcUserIdByEmail(
+    context,
+    user.email
+  );
+
+  if (pefcUserIdFromLearnUpon) {
+    pefcUserId = pefcUserIdFromLearnUpon;
+  }
+
+  context.log(
+    "LearnUpon PEFC User ID final value:",
+    pefcUserId !== "NOT_FOUND" ? "FOUND" : "NOT_FOUND"
+  );
+
+} catch (learnUponError) {
+  context.log(
+    "LearnUpon PEFC User ID lookup failed, continuing without it:",
+    learnUponError.message
+  );
+}
+
+    /************************************************************
+     * 5. LEER LA STRIPE SECRET KEY DESDE AZURE
+     ************************************************************/
+
+    const stripeSecretKey = process.env.STRIPE_SECRET_KEY; // Variable guardada en Azure Environment Variables
+
+    if (!stripeSecretKey) { // Si la variable no existe, Azure no puede llamar a Stripe
+      context.res = {
+        status: 500,
+        body: "Missing STRIPE_SECRET_KEY"
+      };
+      return;
+    }
+
+    // Nunca hacemos context.log(stripeSecretKey). No debemos imprimir secretos en logs.
+
+
+    /************************************************************
+     * 6. BUSCAR EL PAYMENTINTENT EN STRIPE
+     ************************************************************/
+
+    // Stripe ya tiene metadata spree_order_id = 1168.
+    // LearnUpon envía orderId = 1168.
+    // Por eso buscamos PaymentIntent usando ese identificador común.
+    const searchQuery = `metadata['spree_order_id']:'${orderId}'`;
+
+    const searchUrl =
+      "https://api.stripe.com/v1/payment_intents/search?query=" +
+      encodeURIComponent(searchQuery) +
+      "&limit=1";
+
+    context.log("Searching Stripe PaymentIntent by spree_order_id:", orderId);
+
+let paymentIntent = null;
+// Aquí guardaremos el PaymentIntent cuando Stripe lo encuentre.
+// Empieza como null porque todavía no sabemos si existe o si Stripe Search ya lo indexó.
+
+let lastSearchResult = null;
+// Guardamos la última respuesta de Stripe Search.
+// Sirve para devolver información útil si después de varios intentos no encontramos nada.
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Pequeña función auxiliar para "esperar" unos milisegundos.
+// La usamos porque Stripe Search puede tardar unos segundos en indexar metadata nueva.
+
+const retryDelays = [0, 5000, 30000, 30000];
+// Intentos de búsqueda:
+// intento 1: inmediato
+// intento 2: después de 30 segundos
+// intento 3: después de 30 segundos más
+//
+// Total máximo de espera: unos 60 segundos.
+
+for (let attempt = 0; attempt < retryDelays.length; attempt++) {
+  // Este bucle intenta buscar el PaymentIntent varias veces.
+
+  if (retryDelays[attempt] > 0) {
+    // En el primer intento no esperamos.
+    // En los siguientes intentos sí esperamos para dar tiempo a Stripe Search.
+
+    context.log(
+      "Waiting before Stripe search retry:",
+      retryDelays[attempt],
+      "ms"
+    );
+
+    await wait(retryDelays[attempt]);
+  }
+
+  context.log(
+    "Stripe search attempt",
+    attempt + 1,
+    "for spree_order_id:",
+    orderId
+  );
+
+  const searchResponse = await fetch(searchUrl, {
+    method: "GET",
+    headers: {
+      Authorization: "Bearer " + stripeSecretKey,
+      "Stripe-Version": "2020-08-27"
+    }
+  });
+  // Aquí Azure llama a Stripe Search:
+  // GET /v1/payment_intents/search?query=metadata['spree_order_id']:'1238'
+  //
+  // Si Stripe responde 200, significa que la búsqueda fue aceptada.
+  // Pero todavía hay que mirar searchResult.data para saber si encontró algo.
+
+  const searchResult = await searchResponse.json();
+  // Convertimos la respuesta de Stripe en un objeto JavaScript.
+
+  lastSearchResult = searchResult;
+  // Guardamos la última respuesta para diagnóstico si al final no encontramos nada.
+
+  if (!searchResponse.ok) {
+    // Esto solo ocurre si Stripe devuelve un error real:
+    // 401, 403, 500, query inválida, API key incorrecta, etc.
+    //
+    // No es el caso de "no encontrado".
+    // "No encontrado" normalmente sigue siendo 200 OK con data: [].
+
+    context.log("Stripe search error:", JSON.stringify(searchResult));
+
+    context.res = {
+      status: 500,
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: searchResult
+    };
+    return;
+  }
+
+  if (searchResult.data && searchResult.data.length > 0) {
+    // Aquí sí significa que Stripe encontró un PaymentIntent.
+    // data[0] será el primer resultado encontrado.
+
+    paymentIntent = searchResult.data[0];
+
+    context.log("Found PaymentIntent:", paymentIntent.id);
+
+    break;
+    // Salimos del bucle porque ya encontramos lo que necesitábamos.
+  }
+
+  // Si llegamos aquí, Stripe respondió 200 OK, pero no encontró resultados.
+  // Probablemente data estaba vacío: data: []
+  context.log("No PaymentIntent found on attempt", attempt + 1);
+}
+
+if (!paymentIntent) {
+  // Después de todos los intentos, seguimos sin PaymentIntent.
+  // Entonces devolvemos 404 a LearnUpon/Azure caller.
+  //
+  // Este 404 NO aparece en Stripe Logs.
+  // Stripe solo verá los GET /search con 200 OK.
+  // El 404 es la respuesta final de Azure Function.
+
+  context.res = {
+    status: 404,
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: {
+      message: "No Stripe PaymentIntent found after retries",
+      spree_order_id: orderId,
+      lastSearchResult: lastSearchResult
+    }
+  };
+  return;
+}
+
+    context.log("Found PaymentIntent:", paymentIntent.id); // Ejemplo: pi_3ToT...
+
+
+    /************************************************************
+     * 7. PREPARAR METADATA PARA STRIPE
+     ************************************************************/
+
+    const metadata = {
+      learnupon_course_name: courseName,
+      learnupon_webhook_processed_at: new Date().toISOString(),
+      learnupon_pefc_user_id: String(pefcUserId || "NOT_FOUND"),
+      learnupon_webhook_attempt: String(req.headers["x-webhook-attempt"] || ""),
+      learnupon_webhook_source: "Training_azure_function"
+    };
+
+    // Nota: usamos solo keys con prefijo learnupon_ para no tocar metadata crítica de Stripe/Spree.
+
+
+    /************************************************************
+     * 8. PREPARAR UPDATE DEL PAYMENTINTENT
+     ************************************************************/
+
+    const form = new URLSearchParams(); // Stripe espera application/x-www-form-urlencoded, no JSON
+
+    // Campo description del PaymentIntent: visible en Stripe como descripción humana del pago.
+    // No es metadata. Es un campo propio del PaymentIntent.
+    form.append(
+      "description",
+      "PEFC Training - " + courseName + " - Order " + orderId
+    );
+
+    // Añadimos cada campo de metadata al formulario que enviaremos a Stripe.
+    Object.keys(metadata).forEach((key) => {
+      form.append("metadata[" + key + "]", metadata[key]);
+    });
+
+
+    /************************************************************
+     * 9. ACTUALIZAR PAYMENTINTENT EN STRIPE
+     ************************************************************/
+
+    context.log("Updating Stripe PaymentIntent:", paymentIntent.id);
+
+    const updateResponse = await fetch(
+      "https://api.stripe.com/v1/payment_intents/" + paymentIntent.id,
+      {
+        method: "POST", // Stripe usa POST para actualizar objetos existentes
+        headers: {
+          Authorization: "Bearer " + stripeSecretKey,
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Stripe-Version": "2020-08-27"
+        },
+        body: form.toString()
+      }
+    );
+
+    const updateResult = await updateResponse.json(); // Respuesta de Stripe tras actualizar
+
+    if (!updateResponse.ok) { // Si Stripe no pudo actualizar
+      context.log("Stripe update error:", JSON.stringify(updateResult));
+
+      context.res = {
+        status: 500,
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: updateResult
+      };
+      return;
+    }
+
+    context.log("Stripe PaymentIntent updated successfully:", paymentIntent.id);
+
+
+    /************************************************************
+     * 10. RESPUESTA EXITOSA A LEARNUPON
+     ************************************************************/
+
+    context.res = {
+      status: 200, // LearnUpon verá que el webhook fue procesado correctamente
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: {
+        message: "Stripe PaymentIntent updated",
+        orderId: orderId,
+        paymentIntentId: paymentIntent.id,
+        description:
+          "PEFC Training - " + courseName + " - Order " + orderId,
+        metadata: metadata
+      }
+    };
+
+  } catch (error) { // Captura cualquier error inesperado del código
+
+    context.log("Unexpected error:", error.message);
+    context.log("Stack:", error.stack);
+
+    context.res = {
+      status: 500,
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: {
+        error: error.message,
+        stack: error.stack
+      }
+    };
+  }
+};
