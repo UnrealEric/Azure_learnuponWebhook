@@ -1,0 +1,790 @@
+const crypto = require("node:crypto");
+
+/* ==========================================================
+ * 1. CONFIGURACION Y RESPUESTAS
+ * ========================================================== */
+
+const CODE_VERSION = "2026-09-28-orders-v1";
+const STRIPE_API_VERSION = "2020-08-27";
+const MAX_PROCESSING_MS = 5500; // Sin esperas largas dentro del webhook.
+
+function fail(code, httpStatus = 502) {
+  throw Object.assign(new Error(code), { code, httpStatus });
+}
+
+function text(value) {
+  return value == null ? "" : String(value).trim();
+}
+
+function getHeader(req, name) {
+  const key = Object.keys(req.headers || {}).find(
+    (item) => item.toLowerCase() === name.toLowerCase()
+  );
+  return key ? text(req.headers[key]) : "";
+}
+
+function respond(context, status, body) {
+  context.res = {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": "no-store"
+    },
+    body
+  };
+}
+
+function getConfig() {
+  const baseUrl = text(
+    process.env.LEARNUPON_BASE_URL
+  ).replace(/\/+$/, "");
+
+  const username = process.env.LEARNUPON_API_USERNAME;
+  const password = process.env.LEARNUPON_API_PASSWORD;
+  const stripeKey = process.env.STRIPE_SECRET_KEY;
+
+  if (!baseUrl || !username || !password || !stripeKey) {
+    fail("MISSING_API_CONFIGURATION", 500);
+  }
+
+  if (!/^https:\/\/[a-z0-9-]+\.learnupon\.com\/api\/v1$/i.test(baseUrl)) {
+    fail("INVALID_LEARNUPON_BASE_URL", 500);
+  }
+
+  if (!/^(sk|rk)_(test|live)_/.test(stripeKey)) {
+    fail("INVALID_STRIPE_KEY_TYPE", 500);
+  }
+
+  return {
+    baseUrl,
+
+    learnUponHeaders: {
+      Authorization:
+        "Basic " +
+        Buffer.from(username + ":" + password).toString("base64"),
+      Accept: "application/json"
+    },
+
+    stripeHeaders: {
+      Authorization: "Bearer " + stripeKey,
+      "Stripe-Version": STRIPE_API_VERSION
+    },
+
+    liveMode: /^(sk|rk)_live_/.test(stripeKey)
+  };
+}
+
+/* ==========================================================
+ * 2. PETICIONES HTTP: PLAZO LIMITADO Y ERRORES CLAROS
+ * ========================================================== */
+
+async function requestJson(context, url, options, label, deadline) {
+  const remaining = deadline - Date.now();
+
+  if (remaining <= 0) {
+    fail("PROCESSING_DEADLINE_EXCEEDED", 503);
+  }
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      redirect: "manual", // No seguimos redirecciones con credenciales.
+      signal: AbortSignal.timeout(Math.min(3000, remaining))
+    });
+
+    context.log(label + " HTTP " + response.status);
+
+    const raw = await response.text();
+
+    if (!response.ok) {
+      const retryable =
+        [404, 408, 429].includes(response.status) ||
+        response.status >= 500;
+
+      fail(
+        label + "_HTTP_" + response.status,
+        retryable ? 503 : 502
+      );
+    }
+
+    try {
+      return JSON.parse(raw);
+    } catch {
+      fail(label + "_INVALID_JSON");
+    }
+
+  } catch (error) {
+    if (error.httpStatus) {
+      throw error;
+    }
+
+    const timeout = [
+      "AbortError",
+      "TimeoutError"
+    ].includes(error.name);
+
+    fail(
+      label + (timeout ? "_TIMEOUT" : "_NETWORK_ERROR"),
+      503
+    );
+  }
+}
+
+/* ==========================================================
+ * 3. PEFC USER ID: BUSCAR POR EMAIL EN LEARNUPON
+ * ========================================================== */
+
+async function getPefcUserId(context, config, email, deadline) {
+  const wantedEmail = text(email).toLowerCase();
+
+  if (!wantedEmail) {
+    return "";
+  }
+
+  const result = await requestJson(
+    context,
+    config.baseUrl +
+      "/users/search?email=" +
+      encodeURIComponent(text(email)),
+    {
+      method: "GET",
+      headers: config.learnUponHeaders
+    },
+    "LEARNUPON_USER",
+    Math.min(deadline, Date.now() + 2000)
+  );
+
+  const users = Array.isArray(result?.user)
+    ? result.user
+    : [result?.user];
+
+  // Evita tomar por error otro usuario de la respuesta.
+  const matches = users.filter(
+    (user) =>
+      user &&
+      text(user.email).toLowerCase() === wantedEmail
+  );
+
+  if (matches.length !== 1) {
+    fail("PEFC_USER_NOT_UNIQUE");
+  }
+
+  const user = matches[0];
+
+  const direct = text(
+    user.CustomData?.pefc_user_id ||
+    user.customData?.pefc_user_id
+  );
+
+  if (direct) {
+    return direct;
+  }
+
+  // Alternativa: relacionar la definicion del campo con su valor.
+  const definitions =
+    result.customDataFieldDefintions ||
+    result.customDataFieldDefinitions ||
+    [];
+
+  const values = user.customDataFieldValues || [];
+
+  if (!Array.isArray(definitions) || !Array.isArray(values)) {
+    return "";
+  }
+
+  const definition = definitions.find(
+    (field) =>
+      text(field.label).toLowerCase() === "pefc_user_id"
+  );
+
+  if (!definition) {
+    return "";
+  }
+
+  const value = values.find(
+    (field) =>
+      text(field.definition_id) === text(definition.id)
+  );
+
+  return text(value?.value);
+}
+
+/* ==========================================================
+ * 4. PEDIDO LEARNUPON -> PAGO -> ID DE STRIPE
+ * ========================================================== */
+
+async function resolvePayment(context, config, orderRef, deadline) {
+
+  /* ----------------------------------------------------------
+   * 4.1 BUSCAR LA ORDEN R... ENTRE LAS PAGINAS
+   * ---------------------------------------------------------- */
+
+  context.log(
+    "Searching LearnUpon eCommerce order number:",
+    orderRef
+  );
+
+  let order = null;
+  let page = 1;
+  let totalPages = 1;
+
+  while (!order && page <= totalPages) {
+
+    if (Date.now() >= deadline) {
+      fail("PROCESSING_DEADLINE_EXCEEDED", 503);
+    }
+
+    const result = await requestJson(
+      context,
+      config.baseUrl +
+        "/ecommerce/orders?page=" +
+        page,
+      {
+        method: "GET",
+        headers: config.learnUponHeaders
+      },
+      "LEARNUPON_ORDERS_PAGE_" + page,
+      deadline
+    );
+
+
+    /* --------------------------------------------------------
+     * 4.2 EXTRAER ORDENES Y PAGINACION
+     * -------------------------------------------------------- */
+
+    let orders = [];
+
+    if (Array.isArray(result)) {
+      orders = result;
+
+    } else if (Array.isArray(result.orders)) {
+      orders = result.orders;
+
+    } else if (Array.isArray(result.data)) {
+      orders = result.data;
+    }
+
+    const meta = result.meta || {};
+
+    totalPages =
+      Number(meta.pages || meta.total_pages || 1);
+
+    context.log(
+      "LearnUpon orders page:",
+      page,
+      "of",
+      totalPages,
+      "- returned:",
+      orders.length
+    );
+
+
+    /* --------------------------------------------------------
+     * 4.3 BUSCAR EL NUMBER R...
+     * -------------------------------------------------------- */
+
+    order = orders.find(
+      (item) =>
+        text(item?.number) === text(orderRef)
+    );
+
+    if (order) {
+      context.log(
+        "LearnUpon order matched:",
+        order.number,
+        "internal ID:",
+        order.id
+      );
+
+      break;
+    }
+
+    page++;
+  }
+
+
+  /* ----------------------------------------------------------
+   * 4.4 SI NO EXISTE, DEVOLVER ERROR
+   * ---------------------------------------------------------- */
+
+  if (!order) {
+    context.log(
+      "LearnUpon order number not found after pagination:",
+      orderRef
+    );
+
+    fail("LEARNUPON_ORDER_NUMBER_NOT_FOUND", 503);
+  }
+
+
+  /* ----------------------------------------------------------
+   * 4.5 VALIDAR ORDEN
+   * ---------------------------------------------------------- */
+
+  if (
+    order.state !== "complete" ||
+    order.payment_state !== "paid"
+  ) {
+    fail("LEARNUPON_ORDER_NOT_PAID", 503);
+  }
+
+  if (!order.id) {
+    fail("LEARNUPON_INTERNAL_ORDER_ID_MISSING");
+  }
+
+
+  /* ----------------------------------------------------------
+   * 4.6 CONSULTAR PAGOS POR or_...
+   * ---------------------------------------------------------- */
+
+  const paymentsResult = await requestJson(
+    context,
+    config.baseUrl +
+      "/ecommerce/orders/" +
+      encodeURIComponent(String(order.id)) +
+      "/payments/",
+    {
+      method: "GET",
+      headers: config.learnUponHeaders
+    },
+    "LEARNUPON_PAYMENTS",
+    deadline
+  );
+
+
+  /* ----------------------------------------------------------
+   * 4.7 EXTRAER LOS PAGOS
+   * ---------------------------------------------------------- */
+
+  let payments = [];
+
+  if (Array.isArray(paymentsResult)) {
+    payments = paymentsResult;
+
+  } else if (Array.isArray(paymentsResult.payments)) {
+    payments = paymentsResult.payments;
+
+  } else if (Array.isArray(paymentsResult.data)) {
+    payments = paymentsResult.data;
+  }
+
+  context.log(
+    "LearnUpon payments returned:",
+    payments.length
+  );
+
+
+  /* ----------------------------------------------------------
+   * 4.8 BUSCAR EL PAYMENTINTENT pi_...
+   * ---------------------------------------------------------- */
+
+  const stripePayments = payments.filter(
+    (payment) =>
+      /^pi_[A-Za-z0-9]+$/.test(
+        text(payment?.response_code)
+      )
+  );
+
+  const paymentIntentIds = [
+    ...new Set(
+      stripePayments.map(
+        (payment) => text(payment.response_code)
+      )
+    )
+  ];
+
+  if (paymentIntentIds.length === 0) {
+    context.log(
+      "No Stripe PaymentIntent found for order:",
+      order.number
+    );
+
+    fail("STRIPE_PAYMENT_ID_NOT_AVAILABLE", 503);
+  }
+
+  if (paymentIntentIds.length > 1) {
+    fail("MULTIPLE_STRIPE_PAYMENTS", 409);
+  }
+
+
+  /* ----------------------------------------------------------
+   * 4.9 DEVOLVER EL PAYMENTINTENT
+   * ---------------------------------------------------------- */
+
+  const paymentIntentId = paymentIntentIds[0];
+
+  context.log(
+    "Payment resolved:",
+    order.number,
+    "->",
+    order.id,
+    "->",
+    paymentIntentId
+  );
+
+  return {
+    order,
+    paymentIntentId
+  };
+}
+
+/* ==========================================================
+ * 5. VALIDAR EL PAYMENTINTENT ANTES DE MODIFICARLO
+ * ========================================================== */
+
+async function readPaymentIntent(context, config, resolved, deadline) {
+  const payment = await requestJson(
+    context,
+    "https://api.stripe.com/v1/payment_intents/" +
+      encodeURIComponent(resolved.paymentIntentId),
+    {
+      method: "GET",
+      headers: config.stripeHeaders
+    },
+    "STRIPE_READ",
+    deadline
+  );
+
+  if (
+    payment?.id !== resolved.paymentIntentId ||
+    payment.object !== "payment_intent"
+  ) {
+    fail("STRIPE_PAYMENT_ID_MISMATCH", 409);
+  }
+
+  if (payment.livemode !== config.liveMode) {
+    fail("STRIPE_MODE_MISMATCH", 409);
+  }
+
+  if (payment.status !== "succeeded") {
+    fail("STRIPE_PAYMENT_NOT_SUCCEEDED", 503);
+  }
+
+  if (
+    text(payment.currency).toLowerCase() !==
+    text(resolved.order.currency).toLowerCase()
+  ) {
+    fail("STRIPE_CURRENCY_MISMATCH", 409);
+  }
+
+  // Comprobacion adicional cuando Stripe incluye transfer_group.
+  if (
+    payment.transfer_group &&
+    payment.transfer_group !== resolved.order.number
+  ) {
+    fail("STRIPE_ORDER_REFERENCE_MISMATCH", 409);
+  }
+
+  return payment;
+}
+
+/* ==========================================================
+ * 6. PROCESAR UNA COMPRA Y ACTUALIZAR SOLO SUS METADATOS
+ * ========================================================== */
+
+async function processOrder(context, config, order, attempt, deadline) {
+  const orderRef = text(order?.orderId);
+
+  if (!/^[A-Za-z0-9_-]+$/.test(orderRef)) {
+    fail("INVALID_ORDER_REFERENCE", 400);
+  }
+
+  if (
+    order.orderState !== "complete" ||
+    order.paymentState !== "paid"
+  ) {
+    fail("WEBHOOK_ORDER_NOT_PAID", 400);
+  }
+
+  const items = Array.isArray(order.lineItems)
+    ? order.lineItems
+    : [];
+
+  // Incluye todos los nombres si la compra contiene varios cursos.
+  const courseName = [
+    ...new Set(
+      items
+        .map((item) => text(item?.productName))
+        .filter(Boolean)
+    )
+  ].join(" | ");
+
+  if (!courseName) {
+    fail("MISSING_COURSE_NAME", 400);
+  }
+
+  context.log(
+    "LearnUpon order:",
+    orderRef,
+    "delivery attempt:",
+    attempt
+  );
+
+  // Consultamos pedido y usuario en paralelo para reducir la espera.
+  const [resolved, pefcUserId] = await Promise.all([
+    resolvePayment(
+      context,
+      config,
+      orderRef,
+      deadline
+    ),
+
+    getPefcUserId(
+      context,
+      config,
+      order.user?.email,
+      deadline
+    ).catch((error) => {
+      context.log(
+        "PEFC lookup warning:",
+        orderRef,
+        error.code || "LOOKUP_ERROR"
+      );
+
+      // No borramos un PEFC ID existente si falla esta consulta.
+      return "";
+    })
+  ]);
+
+  const payment = await readPaymentIntent(
+    context,
+    config,
+    resolved,
+    deadline
+  );
+
+  context.log(
+    "PEFC User ID:",
+    orderRef,
+    pefcUserId ? "FOUND" : "NOT_FOUND"
+  );
+
+  const metadata = {
+    learnupon_course_name: courseName.slice(0, 500),
+    learnupon_webhook_processed_at: new Date().toISOString(),
+    learnupon_webhook_source: "Training_azure_function"
+  };
+
+  if (attempt) {
+    metadata.learnupon_webhook_attempt = attempt.slice(0, 500);
+  }
+
+  // No escribimos NOT_FOUND como si fuera un identificador.
+  if (pefcUserId) {
+    metadata.learnupon_pefc_user_id = pefcUserId.slice(0, 500);
+  }
+
+  const description = (
+    "PEFC Training - " +
+    courseName +
+    " - Order " +
+    resolved.order.number
+  ).slice(0, 1000);
+
+  const form = new URLSearchParams({ description });
+
+  for (const [key, value] of Object.entries(metadata)) {
+    form.append("metadata[" + key + "]", value);
+  }
+
+  // No enviamos importe, reembolsos, clientes ni metadatos de Spree.
+  const updated = await requestJson(
+    context,
+    "https://api.stripe.com/v1/payment_intents/" +
+      encodeURIComponent(payment.id),
+    {
+      method: "POST",
+      headers: {
+        ...config.stripeHeaders,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: form.toString()
+    },
+    "STRIPE_UPDATE",
+    deadline
+  );
+
+  // Confirmamos que Stripe devolvio los valores enviados.
+  if (
+    updated?.id !== payment.id ||
+    updated.description !== description ||
+    Object.entries(metadata).some(
+      ([key, value]) => updated.metadata?.[key] !== value
+    )
+  ) {
+    fail("STRIPE_UPDATE_NOT_CONFIRMED");
+  }
+
+  context.log(
+    "Stripe PaymentIntent updated successfully:",
+    orderRef,
+    payment.id
+  );
+
+  return {
+    orderId: orderRef,
+    paymentIntentId: payment.id,
+    status: "updated",
+    pefcIdFound: Boolean(pefcUserId)
+  };
+}
+
+/* ==========================================================
+ * 7. ENTRADA HTTP: VALIDAR FIRMA Y PROCESAR EL WEBHOOK
+ * ========================================================== */
+
+module.exports = async function (context, req) {
+  const deadline = Date.now() + MAX_PROCESSING_MS;
+
+  try {
+    context.log(
+      "LearnUpon webhook received; code:",
+      CODE_VERSION
+    );
+
+    if (text(req.method).toUpperCase() !== "POST") {
+      fail("POST_REQUIRED", 405);
+    }
+
+    const secret = process.env.LEARNUPON_WEBHOOK_SECRET;
+
+    if (!secret) {
+      fail("MISSING_LEARNUPON_WEBHOOK_SECRET", 500);
+    }
+
+    // Verificamos los bytes originales; nunca reconstruimos el JSON.
+    const original = req.rawBody ?? req.body;
+
+    if (
+      !Buffer.isBuffer(original) &&
+      typeof original !== "string"
+    ) {
+      fail("RAW_BODY_NOT_AVAILABLE", 500);
+    }
+
+    const rawBody = Buffer.isBuffer(original)
+      ? original
+      : Buffer.from(original, "utf8");
+
+    if (!rawBody.length || rawBody.length > 131072) {
+      fail("INVALID_BODY_SIZE", 400);
+    }
+
+    const signature = getHeader(
+      req,
+      "x-webhook-signature"
+    );
+
+    if (!/^[a-f0-9]{64}$/i.test(signature)) {
+      fail("INVALID_SIGNATURE", 401);
+    }
+
+    const expected = crypto
+      .createHmac("sha256", secret)
+      .update(rawBody)
+      .digest();
+
+    if (
+      !crypto.timingSafeEqual(
+        expected,
+        Buffer.from(signature, "hex")
+      )
+    ) {
+      fail("INVALID_SIGNATURE", 401);
+    }
+
+    context.log("LearnUpon webhook signature validated");
+
+    if (
+      getHeader(req, "x-webhook-type") !==
+      "ecommerce_purchase_completion"
+    ) {
+      fail("INVALID_WEBHOOK_TYPE", 400);
+    }
+
+    let body;
+
+    try {
+      body = JSON.parse(rawBody.toString("utf8"));
+    } catch {
+      fail("INVALID_JSON", 400);
+    }
+
+    const orders = Array.isArray(body?.data)
+      ? body.data
+      : body?.data
+        ? [body.data]
+        : [];
+
+    if (!orders.length || orders.length > 10) {
+      fail("INVALID_ORDER_BATCH", 400);
+    }
+
+    const config = getConfig();
+    const attempt = getHeader(req, "x-webhook-attempt");
+
+    context.log(
+      "Webhook ID:",
+      getHeader(req, "x-webhook-id"),
+      "attempt:",
+      attempt
+    );
+
+    // No ignoramos pedidos adicionales dentro de data[].
+    const results = await Promise.all(
+      orders.map(async (order) => {
+        try {
+          return await processOrder(
+            context,
+            config,
+            order,
+            attempt,
+            deadline
+          );
+
+        } catch (error) {
+          const code = error.code || "INTERNAL_ERROR";
+
+          context.log(
+            "Order failed:",
+            text(order?.orderId),
+            code
+          );
+
+          return {
+            orderId: text(order?.orderId),
+            status: "failed",
+            error: code,
+            httpStatus: error.httpStatus || 500
+          };
+        }
+      })
+    );
+
+    const failed = results.find(
+      (result) => result.status === "failed"
+    );
+
+    const status = failed
+      ? (results.length === 1 ? failed.httpStatus : 503)
+      : 200;
+
+    context.log("Webhook response:", status);
+
+    respond(context, status, {
+      version: CODE_VERSION,
+      results
+    });
+
+  } catch (error) {
+    const status = error.httpStatus || 500;
+    const code = error.code || "INTERNAL_ERROR";
+
+    context.log("Webhook rejected:", status, code);
+
+    respond(context, status, {
+      error: code,
+      version: CODE_VERSION
+    });
+  }
+};
